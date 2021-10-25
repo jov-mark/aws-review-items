@@ -1,0 +1,460 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: AWS Capstone project - jmarkovic
+Parameters:
+  AnalyticsRole:
+    Type: String
+    Default: 'arn:aws:iam::571632058847:role/amilosevic-capstone-analytics'
+  FirehoseRole:
+    Type: String
+    Default: 'arn:aws:iam::571632058847:role/dmaslarevic_firehose_delivery_role'
+  GlueRole:
+    Type: String
+    Default: 'arn:aws:iam::571632058847:role/amilosevic-capstone-glue'
+  LambdaRole:
+    Type: String
+    Default: 'arn:aws:iam::571632058847:role/amilosevic-capstone-lambda'
+  CapstoneBucket:
+    Type: String
+    Default: 'arn:aws:s3:::jmarkovic-capstone-bucket'
+  AnalyticsName:
+    Type: String
+    Default: views-analytics
+Resources:
+  ReviewsStorage:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: jmarkovic-reviews-cf
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt 
+              - LambdaReviewsCrawlerStarter
+              - Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: reviews/
+  KinesisReviewsStream:
+    Type: 'AWS::Kinesis::Stream'
+    Properties:
+      Name: jmarkovic-review-stream-cf
+      ShardCount: 1
+  FirehoseReviews:
+    Type: 'AWS::KinesisFirehose::DeliveryStream'
+    Properties:
+      DeliveryStreamName: jmarkovic-freviews-cf
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt 
+          - ReviewsStorage
+          - Arn
+        Prefix: reviews/
+        RoleARN: !Ref FirehoseRole
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 5
+  ReviewsCrawler:
+    Type: 'AWS::Glue::Crawler'
+    Properties:
+      DatabaseName: !Ref ReviewsGlueDatabase
+      TablePrefix: ''
+      Description: Crawler for review data from S3 storage
+      Name: jmarkovic_rev_crawler_cf
+      Role: !Ref GlueRole
+      Targets:
+        S3Targets:
+          - Path: 's3://jmarkovic-reviews-cf/reviews/'
+  ReviewsGlueDatabase:
+    Type: 'AWS::Glue::Database'
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Description: Capstone database
+        Name: jm_reviews_cf
+  LambdaReviewsCrawlerStarter:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: jmarkovic-capstone-bucket
+        S3Key: reviews_crawler.zip
+      Role: !Ref LambdaRole
+      Runtime: python3.8
+      Handler: reviews_crawler.lambda_handler
+      FunctionName: jmarkovic-reviews-crawler-starter
+      MemorySize: 128
+      Timeout: 900
+      Description: Triggers crawler dedicated for reviews data
+  LambdaRevCrawlerPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt 
+        - LambdaReviewsCrawlerStarter
+        - Arn
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: 'arn:aws:s3:::jmarkovic-reviews-cf'
+  ReviewsAnalysis:
+    Type: 'AWS::Athena::NamedQuery'
+    Properties:
+      Database: !Ref ReviewsGlueDatabase
+      Name: jm_rev_athena_cf
+      QueryString: >
+        SELECT item_id, AVG(review_stars) AS average_rating FROM reviews WHERE
+        review_title <> '' AND review_text <> '' GROUP BY item_id
+  SNSViewsTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      Subscription:
+        - Endpoint: !GetAtt 
+            - LambdaViewsCrawlerStarter
+            - Arn
+          Protocol: lambda
+        - Endpoint: !GetAtt 
+            - LambdaRunEMR
+            - Arn
+          Protocol: lambda
+      TopicName: ViewsTopic
+  ViewsStorage:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: jmarkovic-views-cf
+  KinesisViewsStream:
+    Type: 'AWS::Kinesis::Stream'
+    Properties:
+      Name: jmarkovic-view-stream-cf
+      ShardCount: 1
+  FirehoseViews:
+    Type: 'AWS::KinesisFirehose::DeliveryStream'
+    Properties:
+      DeliveryStreamName: jmarkovic-fviews-cf
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt 
+          - ViewsStorage
+          - Arn
+        Prefix: views/
+        RoleARN: !Ref FirehoseRole
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 5
+  LambdaRunEMR:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: jmarkovic-capstone-bucket
+        S3Key: emr_starter.zip
+      Role: !Ref LambdaRole
+      Runtime: python3.8
+      Handler: emr_starter.lambda_handler
+      FunctionName: jm-emr-starter-cf
+      MemorySize: 128
+      Timeout: 900
+      Description: Lambda function for starting emr
+  LambdaEMRPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt 
+        - LambdaRunEMR
+        - Arn
+      Principal: sns.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: 'arn:aws:sns:us-east-1:571632058847:ViewsTopic'
+  DynamoDBViews:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: user_ip
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_ip
+          KeyType: HASH
+      TableName: jmarkovic_db_views
+      TimeToLiveSpecification:
+        AttributeName: time_to_live
+        Enabled: true
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+  ViewsCrawler:
+    Type: 'AWS::Glue::Crawler'
+    Properties:
+      DatabaseName: !Ref ViewsGlueDatabase
+      TablePrefix: ''
+      Description: crawler for view data table in s3 bucket
+      Name: jmarkovic_vie_crawler_cf
+      Role: !Ref GlueRole
+      Targets:
+        S3Targets:
+          - Path: 's3://jmarkovic-views-cf/views/'
+  ViewsGlueDatabase:
+    Type: 'AWS::Glue::Database'
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Description: Capstone database
+        Name: jm_views_cf
+  LambdaViewsCrawlerStarter:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: jmarkovic-capstone-bucket
+        S3Key: views_crawler.zip
+      Role: !Ref LambdaRole
+      Runtime: python3.8
+      Handler: views_crawler.lambda_handler
+      FunctionName: jmarkovic-views-crawler-starter
+      MemorySize: 128
+      Timeout: 900
+      Description: Triggers crawler for views data
+  LambdaVieCrawlerPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt 
+        - LambdaViewsCrawlerStarter
+        - Arn
+      Principal: sns.amazonaws.com
+      SourceArn: 'arn:aws:sns:us-east-1:571632058847:ViewsTopic'
+  ViewsAnalysis:
+    Type: 'AWS::Athena::NamedQuery'
+    Properties:
+      Database: !Ref ViewsGlueDatabase
+      Name: jm_vie_athena_cf
+      QueryString: |
+        SELECT device_type, COUNT(*) FROM views GROUP BY device_type
+  LambdaFilterFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: jmarkovic-capstone-bucket
+        S3Key: filter_ips.zip
+      Role: !Ref LambdaRole
+      Runtime: python3.8
+      Handler: filter_ips.lambda_handler
+      FunctionName: jmarkovic-ips-filter-cf
+      MemorySize: 128
+      Timeout: 25
+    Description: Filters suspicious ips from the Kinesis Stream
+  EventSourceMappingItems:
+    Type: 'AWS::Lambda::EventSourceMapping'
+    Properties:
+      EventSourceArn: !Join 
+        - ''
+        - - 'arn:aws:kinesis:'
+          - !Ref 'AWS::Region'
+          - ':'
+          - !Ref 'AWS::AccountId'
+          - ':stream/'
+          - !Ref KinesisViewsStream
+      FunctionName: !GetAtt 
+        - LambdaFilterFunction
+        - Arn
+      StartingPosition: LATEST
+  EventSourceMappingReviews:
+    Type: 'AWS::Lambda::EventSourceMapping'
+    Properties:
+      EventSourceArn: !Join 
+        - ''
+        - - 'arn:aws:kinesis:'
+          - !Ref 'AWS::Region'
+          - ':'
+          - !Ref 'AWS::AccountId'
+          - ':stream/'
+          - !Ref KinesisReviewsStream
+      FunctionName: !GetAtt 
+        - LambdaFilterFunction
+        - Arn
+      StartingPosition: LATEST
+  KinesisViewsAnalytics:
+    Type: 'AWS::KinesisAnalytics::Application'
+    Properties:
+      ApplicationCode: |-
+        CREATE OR REPLACE STREAM "POPULAR_ITEMS"
+          ("item_id" VARCHAR(5), "items_count" DOUBLE);
+
+        CREATE OR REPLACE PUMP "ITEMS_PUMP" AS
+          INSERT INTO "POPULAR_ITEMS"
+            SELECT STREAM *
+              FROM TABLE (TOP_K_ITEMS_TUMBLING(
+                CURSOR(SELECT STREAM * FROM "SOURCE_SQL_STREAM_001"),
+                'ItemId',         -- name of column in single quotes
+                10,                -- number of the most frequently occurring values
+                60                 -- tumbling window size in seconds
+            )
+        );
+      ApplicationDescription: Finding most popular items by views
+      ApplicationName: jmarkovic-items-cf
+      Inputs:
+        - NamePrefix: SOURCE_SQL_STREAM
+          InputParallelism:
+            Count: 1
+          KinesisFirehoseInput:
+            ResourceARN: !GetAtt 
+              - FirehoseViews
+              - Arn
+            RoleARN: !Ref AnalyticsRole
+          InputSchema:
+            RecordColumns:
+              - Name: DeviceId
+                SqlType: VARCHAR(50)
+                Mapping: $.device_id
+              - Name: DeviceType
+                SqlType: VARCHAR(50)
+                Mapping: $.device_type
+              - Name: ItemId
+                SqlType: VARCHAR(50)
+                Mapping: $.item_id
+              - Name: TS
+                SqlType: VARCHAR(50)
+                Mapping: $.ts
+              - Name: UserIP
+                SqlType: VARCHAR(50)
+                Mapping: $.user_ip
+            RecordFormat:
+              RecordFormatType: JSON
+              MappingParameters:
+                JSONMappingParameters:
+                  RecordRowPath: $
+  ViewsAnalyticsOutput:
+    Type: 'AWS::KinesisAnalytics::ApplicationOutput'
+    DependsOn: KinesisViewsAnalytics
+    Properties:
+      ApplicationName: !Ref KinesisViewsAnalytics
+      Output:
+        Name: POPULAR_ITEMS
+        DestinationSchema:
+          RecordFormatType: JSON
+        LambdaOutput:
+          ResourceARN: !GetAtt 
+            - LambdaSNSTrigger
+            - Arn
+          RoleARN: !Ref AnalyticsRole
+  ViewsCategoriesAnalytics:
+    Type: 'AWS::KinesisAnalytics::Application'
+    Properties:
+      ApplicationCode: >-
+        CREATE OR REPLACE STREAM "CATEGORIES_STREAM" (category VARCHAR(50),
+        views DOUBLE);
+
+        CREATE OR REPLACE PUMP "CATEGORY_PUMP" AS
+          INSERT INTO "CATEGORIES_STREAM"
+            SELECT STREAM *
+              FROM TABLE (TOP_K_ITEMS_TUMBLING(
+                CURSOR(
+                  SELECT STREAM * FROM "SOURCE_SQL_STREAM_001" AS source
+                  JOIN "categories" as reference
+                  ON source."ItemId" = reference."item_id"
+                ),
+                'category',
+                10,
+                60
+            )
+        );
+      ApplicationDescription: Finding most popular categories by views
+      ApplicationName: jmarkovic-categories-cf
+      Inputs:
+        - NamePrefix: SOURCE_SQL_STREAM
+          InputParallelism:
+            Count: 1
+          KinesisFirehoseInput:
+            ResourceARN: !GetAtt 
+              - FirehoseViews
+              - Arn
+            RoleARN: !Ref AnalyticsRole
+          InputSchema:
+            RecordColumns:
+              - Name: DeviceId
+                SqlType: VARCHAR(50)
+                Mapping: $.device_id
+              - Name: DeviceType
+                SqlType: VARCHAR(50)
+                Mapping: $.device_type
+              - Name: ItemId
+                SqlType: VARCHAR(50)
+                Mapping: $.item_id
+              - Name: TS
+                SqlType: VARCHAR(50)
+                Mapping: $.ts
+              - Name: UserIP
+                SqlType: VARCHAR(50)
+                Mapping: $.user_ip
+            RecordFormat:
+              RecordFormatType: JSON
+              MappingParameters:
+                JSONMappingParameters:
+                  RecordRowPath: $
+  PopularCategories:
+    Type: 'AWS::KinesisFirehose::DeliveryStream'
+    Properties:
+      DeliveryStreamName: jmarkovic-categories-stream-cf
+      S3DestinationConfiguration:
+        BucketARN: !Ref CapstoneBucket
+        Prefix: popular_categories/
+        RoleARN: !Ref FirehoseRole
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 5
+  CategoriesOutput:
+    Type: 'AWS::KinesisAnalytics::ApplicationOutput'
+    DependsOn: ViewsCategoriesAnalytics
+    Properties:
+      ApplicationName: !Ref ViewsCategoriesAnalytics
+      Output:
+        Name: CATEGORIES_STREAM
+        DestinationSchema:
+          RecordFormatType: JSON
+        KinesisFirehoseOutput:
+          ResourceARN: !GetAtt 
+            - PopularCategories
+            - Arn
+          RoleARN: !Ref AnalyticsRole
+  ReferenceData:
+    Type: 'AWS::KinesisAnalytics::ApplicationReferenceDataSource'
+    Properties:
+      ApplicationName: !Ref ViewsCategoriesAnalytics
+      ReferenceDataSource:
+        TableName: categories
+        ReferenceSchema:
+          RecordColumns:
+            - Name: item_id
+              SqlType: VARCHAR(50)
+            - Name: title
+              SqlType: VARCHAR(16)
+            - Name: description
+              SqlType: VARCHAR(16)
+            - Name: category
+              SqlType: VARCHAR(16)
+          RecordFormat:
+            RecordFormatType: CSV
+            MappingParameters:
+              CSVMappingParameters:
+                RecordColumnDelimiter: ','
+                RecordRowDelimiter: \n
+        S3ReferenceDataSource:
+          BucketARN: !Ref CapstoneBucket
+          FileKey: items.csv
+          ReferenceRoleARN: !Ref AnalyticsRole
+  SNSTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      Subscription:
+        - Endpoint: jmarkovic@griddynamics.com
+          Protocol: email
+  LambdaSNSTrigger:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: jmarkovic-capstone-bucket
+        S3Key: sns_trigger.zip
+      Role: !Ref LambdaRole
+      Runtime: python3.8
+      Handler: sns_trigger.lambda_handler
+      FunctionName: jmarkovic-sns-trigger-cf
+      MemorySize: 128
+      Timeout: 900
+      Environment:
+        Variables:
+          SnsArn: !Ref SNSTopic
+      Description: Lambda function to trigger SNS and send email notification
+
